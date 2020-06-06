@@ -12,8 +12,9 @@ import gzip
 import configparser
 import logging
 import argparse
+import re
 from string import Template
-from pprint import pprint
+from collections import namedtuple
 
 
 def initLogging(log_dir):
@@ -21,42 +22,33 @@ def initLogging(log_dir):
     Инициализируем логирование
     """
     logging.basicConfig(
-        filename=log_dir,
+        filename=os.path.join(log_dir, "log_analizer.log"),
         level=logging.INFO,
         format='[%(asctime)s] %(levelname).1s %(message)s',
         datefmt='%Y.%m.%d %H:%M:%S'
     )
 
 
-def createParser():
+def parse_config():
     """
-    Парсер для командной строки
+    Читаем конфиг по переданному пути (./config - адрес по-умолчанию)
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default="./config")
-    return parser
-
-
-def read_config(config_dir):
-    """
-    Собираем конфиг по переданному пути (./config - адрес по-умолчанию)
-    """
-    if not os.path.exists(config_dir + '/config.ini'):
+    console_data = parser.parse_args()
+    if not os.path.exists(os.path.join(console_data.config, 'config.ini')):
         raise FileNotFoundError
     config = configparser.ConfigParser()
-    config.read(config_dir + '/config.ini')
+    config.read(os.path.join(console_data.config, 'config.ini'))
     if 'log_analyzer' in config:
-        try:
-            config = {
-                "REPORT_SIZE": int(config.get('log_analyzer', 'REPORT_SIZE', fallback='1000')),
-                "REPORT_DIR": config.get('log_analyzer', 'REPORT_DIR', fallback='./reports'),
-                "LOG_DIR": config.get('log_analyzer', 'LOG_DIR', fallback='./log'),
-                "PROG_LOG_DIR": config.get('log_analyzer', 'PROG_LOG_DIR', fallback=None),
-                "ERROR_LEVEL": float(config.get('log_analyzer', 'ERROR_LEVEL', fallback='20')),
-            }
-            return config
-        except ValueError as e:
-            raise e
+        config = {
+            "REPORT_SIZE": config.get('log_analyzer', 'REPORT_SIZE', fallback='1000'),
+            "REPORT_DIR": config.get('log_analyzer', 'REPORT_DIR', fallback='./reports'),
+            "LOG_DIR": config.get('log_analyzer', 'LOG_DIR', fallback='./log'),
+            "PROG_LOG_DIR": config.get('log_analyzer', 'PROG_LOG_DIR', fallback='.'),
+            "ERROR_LEVEL": config.get('log_analyzer', 'ERROR_LEVEL', fallback='20'),
+        }
+        return config
 
 
 def search_log(log_dir):
@@ -66,22 +58,16 @@ def search_log(log_dir):
     """
     if not os.path.exists(log_dir):
         raise FileNotFoundError
-    list_files = {
-        x.split('.')[1][-8::]: x for x in os.listdir(path=log_dir)
-        if x.split('.')[0] == 'nginx-access-ui'
-    }
-    list_dates = list_files.keys()
-    return log_dir + '/' + list_files[max(list_dates)], max(list_dates)
-
-
-def search_report(report_dir):
-    """
-    Cобираем все даты отчетов в папке report_dir в список
-    """
-    list_report_dates = [
-        x[7:17].replace('.', '') for x in os.listdir(path=report_dir)
-    ]
-    return list_report_dates
+    max_date = "00000000"
+    for file in os.listdir(path=log_dir):
+        file_match = re.match(r"nginx-access-ui\.log-(\d{8})", file)
+        if file_match:
+            if file_match.group(1) >= max_date:
+                max_date = file_match.group(1)
+                filename = file
+    Log = namedtuple('Log', 'file date')
+    new_log = Log(os.path.join(log_dir, filename), max_date)
+    return new_log
 
 
 def extract_log(log_data):
@@ -114,7 +100,7 @@ def mediana(list):
         return (data[i - 1] + data[i]) / 2
 
 
-def save_logs(log_stat, report_dir, log_name):
+def save_logs(log_stat, report_full_name):
     """
         Сохраняет подготовленную статистику в шаблонный отчет в папку report_dir
     """
@@ -123,8 +109,10 @@ def save_logs(log_stat, report_dir, log_name):
         raise FileNotFoundError
     with open("report.html", "r") as f:
         html_data = Template(f.read()).safe_substitute(table_json=log_stat)
-        file_name = f"{report_dir}/report-{log_name[:4:]}.{log_name[4:6:]}.{log_name[6::]}.html"
-        with open(file_name, "w") as f_out:
+        if not os.path.exists(os.path.dirname(report_full_name)):
+            logging.error(f"No such directory: {os.path.dirname(report_full_name)}")
+            raise FileNotFoundError
+        with open(report_full_name, "w") as f_out:
             f_out.write(html_data)
 
 
@@ -155,7 +143,7 @@ def create_report(log_stat, report_size, count_all, time_all):
 
 def agregate_stat(logs):
     """
-    Агрегирует логи, на выходе словарь с данными по каждому url, 
+    Агрегирует логи, на выходе словарь с данными по каждому url,
     суммарное количество и суммарное время
     """
     log_stat = {}
@@ -188,32 +176,35 @@ def read_logs(file_adress):
 
 
 def main():
-    parser = createParser()
-    console_data = parser.parse_args()
-    config = read_config(console_data.config)
+    config = parse_config()
     initLogging(config["PROG_LOG_DIR"])
     logging.info("Program started")
-    log_file, log_date = search_log(config["LOG_DIR"])
+    try:
+        report_size = int(config["REPORT_SIZE"])
+        error_level = float(config["ERROR_LEVEL"])
+    except ValueError:
+        logging.error("Config error. Report size or error level are not a digit")
+        return
+    new_log = search_log(config["LOG_DIR"])
     logging.info("Log file found")
-    report_dates = search_report(config["REPORT_DIR"])
-    logging.info("Report files found")
-    if log_date in report_dates:
+    report_name = f"report-{new_log.date[:4:]}.{new_log.date[4:6:]}.{new_log.date[6::]}.html"
+    report_full_name = os.path.join(config["REPORT_DIR"], report_name)
+    if os.path.exists(report_full_name):
         logging.info("Done! This log already processed")
         return
-    logs = map(extract_log, read_logs(log_file))
+    logs = map(extract_log, read_logs(new_log.file))
     log_stat, count_all, time_all = agregate_stat(logs)
-    error_per = log_stat["url_error"]["count"]/count_all*100
-    if error_per >= config["ERROR_LEVEL"]:
+    error_per = log_stat["url_error"]["count"] / count_all * 100
+    if error_per >= error_level:
         logging.error("Error rate is too high: ", error_per)
         return
     logging.info("All logs agregated")
-
     report = create_report(
-        log_stat, config["REPORT_SIZE"],
+        log_stat, report_size,
         count_all, time_all
     )
     logging.info("The report created")
-    save_logs(report, config["REPORT_DIR"], log_date)
+    save_logs(report, report_full_name)
     logging.info("Done!")
 
 
