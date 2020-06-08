@@ -16,6 +16,8 @@ import re
 from string import Template
 from collections import namedtuple
 
+Log = namedtuple('Log', 'file date')
+
 
 def initLogging(log_dir):
     """
@@ -29,17 +31,22 @@ def initLogging(log_dir):
     )
 
 
-def parse_config():
+def parse_args():
     """
-    Читаем конфиг по переданному пути (./config - адрес по-умолчанию)
+    Парсим аргументы, переданные при запуске скрипта
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default="./config")
     console_data = parser.parse_args()
-    if not os.path.exists(os.path.join(console_data.config, 'config.ini')):
-        raise FileNotFoundError
+    return console_data.config
+
+
+def parse_config(config_dir):
+    """
+    Читаем конфиг по переданному пути (./config - адрес по-умолчанию)
+    """
     config = configparser.ConfigParser()
-    config.read(os.path.join(console_data.config, 'config.ini'))
+    config.read(os.path.join(config_dir, 'config.ini'))
     if 'log_analyzer' in config:
         config = {
             "REPORT_SIZE": config.get('log_analyzer', 'REPORT_SIZE', fallback='1000'),
@@ -57,32 +64,33 @@ def search_log(log_dir):
     возвращает адрес лога и его дату
     """
     if not os.path.exists(log_dir):
-        raise FileNotFoundError
-    max_date = "00000000"
+        logging.error(f"No such file or directory: {log_dir}")
+    max_date = ""
     for file in os.listdir(path=log_dir):
-        file_match = re.match(r"nginx-access-ui\.log-(\d{8})", file)
+        pattern = r"nginx-access-ui\.log-([1-9]\d{3}(0[1-9]|1[0-2])(0[1-9]|[1-2]\d|3[0-1]))"
+        file_match = re.match(pattern, file)
         if file_match:
             if file_match.group(1) >= max_date:
                 max_date = file_match.group(1)
                 filename = file
-    Log = namedtuple('Log', 'file date')
     new_log = Log(os.path.join(log_dir, filename), max_date)
     return new_log
 
 
-def extract_log(log_data):
+def extract_log(draft_log_data):
     """
-    Парсер для файла с логом. Возвращает url и время запроса
+    Генератор-парсер для файла с логом. Возвращает url и время запроса
     """
-    log_data_str = str(log_data, 'utf-8')
-    request_time = float(log_data_str.split(' ')[-1])
-    start_url = log_data_str.find('"') + 1
-    end_url = log_data_str.find('"', start_url)
-    try:
-        reques_url = log_data_str[start_url:end_url].split(" ")[1]
-    except IndexError:
-        reques_url = "url_error"
-    return [reques_url, request_time]
+    for log_data in draft_log_data:
+        log_data_str = str(log_data, 'utf-8')
+        request_time = float(log_data_str.split(' ')[-1])
+        start_url = log_data_str.find('"') + 1
+        end_url = log_data_str.find('"', start_url)
+        try:
+            reques_url = log_data_str[start_url:end_url].split(" ")[1]
+        except IndexError:
+            reques_url = None
+        yield [reques_url, request_time]
 
 
 def mediana(list):
@@ -102,16 +110,16 @@ def mediana(list):
 
 def save_logs(log_stat, report_full_name):
     """
-        Сохраняет подготовленную статистику в шаблонный отчет в папку report_dir
+    Сохраняет подготовленную статистику в шаблонный отчет в папку report_dir
     """
     if not os.path.exists("report.html"):
         logging.error("No such file or directory: 'report.html'")
-        raise FileNotFoundError
     with open("report.html", "r") as f:
         html_data = Template(f.read()).safe_substitute(table_json=log_stat)
         if not os.path.exists(os.path.dirname(report_full_name)):
-            logging.error(f"No such directory: {os.path.dirname(report_full_name)}")
-            raise FileNotFoundError
+            logging.error(
+                f"No such directory: {os.path.dirname(report_full_name)}"
+            )
         with open(report_full_name, "w") as f_out:
             f_out.write(html_data)
 
@@ -176,7 +184,8 @@ def read_logs(file_adress):
 
 
 def main():
-    config = parse_config()
+    config_dir = parse_args()
+    config = parse_config(config_dir)
     initLogging(config["PROG_LOG_DIR"])
     logging.info("Program started")
     try:
@@ -192,9 +201,9 @@ def main():
     if os.path.exists(report_full_name):
         logging.info("Done! This log already processed")
         return
-    logs = map(extract_log, read_logs(new_log.file))
+    logs = extract_log(read_logs(new_log.file))
     log_stat, count_all, time_all = agregate_stat(logs)
-    error_per = log_stat["url_error"]["count"] / count_all * 100
+    error_per = log_stat[None]["count"] / count_all * 100
     if error_per >= error_level:
         logging.error("Error rate is too high: ", error_per)
         return
