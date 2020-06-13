@@ -14,12 +14,14 @@ import logging
 import argparse
 import re
 from string import Template
-from collections import namedtuple
+from collections import namedtuple, defaultdict
+from datetime import datetime
+from typing import Generator
 
 Log = namedtuple('Log', 'file date')
 
 
-def initLogging(log_dir):
+def initLogging(log_dir: str):
     """
     Инициализируем логирование
     """
@@ -31,7 +33,7 @@ def initLogging(log_dir):
     )
 
 
-def parse_args():
+def parse_args() -> str:
     """
     Парсим аргументы, переданные при запуске скрипта
     """
@@ -41,7 +43,7 @@ def parse_args():
     return console_data.config
 
 
-def parse_config(config_dir):
+def read_config(config_dir: str) -> dict:
     """
     Читаем конфиг по переданному пути (./config - адрес по-умолчанию)
     """
@@ -56,28 +58,54 @@ def parse_config(config_dir):
             "ERROR_LEVEL": config.get('log_analyzer', 'ERROR_LEVEL', fallback='20'),
         }
         return config
+    else:
+        initLogging('.')
+        logging.error("Bad config")
+        raise SystemExit
 
 
-def search_log(log_dir):
+def try_parse_config(config: dict) -> tuple:
+    """
+    Парсим уровень ошибок и количество url в отчете, полученных из конфига
+    """
+    try:
+        report_size = int(config["REPORT_SIZE"])
+        error_level = float(config["ERROR_LEVEL"])
+    except ValueError:
+        logging.error(
+            "Config error. Report size or error level are not a digit"
+        )
+        raise SystemExit
+    return (report_size, error_level)
+
+
+def search_log(log_dir: str) -> "Log":
     """
     Ищет в папке log_dir последний актуальный лог,
     возвращает адрес лога и его дату
     """
     if not os.path.exists(log_dir):
         logging.error(f"No such file or directory: {log_dir}")
-    max_date = ""
+        raise SystemExit
+    max_date = None
     for file in os.listdir(path=log_dir):
         pattern = r"nginx-access-ui\.log-([1-9]\d{3}(0[1-9]|1[0-2])(0[1-9]|[1-2]\d|3[0-1]))"
         file_match = re.match(pattern, file)
         if file_match:
-            if file_match.group(1) >= max_date:
-                max_date = file_match.group(1)
+            try:
+                curr_date = datetime.strptime(file_match.group(1), '%Y%m%d')
+            except ValueError:
+                continue
+            if max_date is None or curr_date >= max_date:
+                max_date = curr_date
                 filename = file
-    new_log = Log(os.path.join(log_dir, filename), max_date)
-    return new_log
+    if max_date is None:
+        logging.info(f"Done! {log_dir} doesn't have any logs file")
+        raise SystemExit
+    return Log(os.path.join(log_dir, filename), max_date)
 
 
-def extract_log(draft_log_data):
+def extract_log(draft_log_data: Generator) -> Generator:
     """
     Генератор-парсер для файла с логом. Возвращает url и время запроса
     """
@@ -93,11 +121,11 @@ def extract_log(draft_log_data):
         yield [reques_url, request_time]
 
 
-def mediana(list):
+def mediana(data: list) -> float:
     """
     Нахождение медианы в листе
     """
-    data = sorted(list)
+    data = sorted(data)
     n = len(data)
     if n == 0:
         return None
@@ -108,23 +136,22 @@ def mediana(list):
         return (data[i - 1] + data[i]) / 2
 
 
-def save_logs(log_stat, report_full_name):
+def save_logs(log_stat: list, report_full_name: str):
     """
     Сохраняет подготовленную статистику в шаблонный отчет в папку report_dir
     """
     if not os.path.exists("report.html"):
         logging.error("No such file or directory: 'report.html'")
+        raise SystemExit
+    if not os.path.exists(os.path.dirname(report_full_name)):
+        os.mkdir(os.path.dirname(report_full_name))
     with open("report.html", "r") as f:
         html_data = Template(f.read()).safe_substitute(table_json=log_stat)
-        if not os.path.exists(os.path.dirname(report_full_name)):
-            logging.error(
-                f"No such directory: {os.path.dirname(report_full_name)}"
-            )
         with open(report_full_name, "w") as f_out:
             f_out.write(html_data)
 
 
-def create_report(log_stat, report_size, count_all, time_all):
+def create_report(log_stat: defaultdict, report_size: int, count_all: int, time_all: float) -> list:
     """
     На основе агрегированных данных логов строит отчет, находит все метрики
     """
@@ -149,30 +176,28 @@ def create_report(log_stat, report_size, count_all, time_all):
     return report
 
 
-def agregate_stat(logs):
+def agregate_stat(logs: Generator) -> tuple:
     """
     Агрегирует логи, на выходе словарь с данными по каждому url,
     суммарное количество и суммарное время
     """
-    log_stat = {}
+    log_stat = defaultdict(lambda: {
+        "count": 0,
+        "time_sum": 0,
+        "values": [],
+    })
     count_all = 0
     time_all = 0
-    for log in logs:
-        if log[0] not in log_stat:
-            log_stat[log[0]] = {
-                "count": 0,
-                "time_sum": 0,
-                "values": [],
-            }
-        log_stat[log[0]]["count"] += 1
-        log_stat[log[0]]["time_sum"] += log[1]
-        log_stat[log[0]]["values"].append(log[1])
+    for url, rtime in logs:
+        log_stat[url]["count"] += 1
+        log_stat[url]["time_sum"] += rtime
+        log_stat[url]["values"].append(rtime)
         count_all += 1
-        time_all += log[1]
+        time_all += rtime
     return log_stat, count_all, time_all
 
 
-def read_logs(file_adress):
+def read_logs(file_adress: str) -> Generator:
     """
     Читает файл с логами
     """
@@ -185,18 +210,13 @@ def read_logs(file_adress):
 
 def main():
     config_dir = parse_args()
-    config = parse_config(config_dir)
+    config = read_config(config_dir)
     initLogging(config["PROG_LOG_DIR"])
     logging.info("Program started")
-    try:
-        report_size = int(config["REPORT_SIZE"])
-        error_level = float(config["ERROR_LEVEL"])
-    except ValueError:
-        logging.error("Config error. Report size or error level are not a digit")
-        return
+    report_size, error_level = try_parse_config(config)
     new_log = search_log(config["LOG_DIR"])
     logging.info("Log file found")
-    report_name = f"report-{new_log.date[:4:]}.{new_log.date[4:6:]}.{new_log.date[6::]}.html"
+    report_name = f"report-{new_log.date.strftime('%Y.%m.%d')}.html"
     report_full_name = os.path.join(config["REPORT_DIR"], report_name)
     if os.path.exists(report_full_name):
         logging.info("Done! This log already processed")
